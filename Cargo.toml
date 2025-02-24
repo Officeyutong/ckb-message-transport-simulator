@@ -1,0 +1,7 @@
+[package]
+name = "ckb-message-transport-simulator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ckb-gen-types = "0.121.0"
