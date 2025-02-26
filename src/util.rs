@@ -1,12 +1,17 @@
-use std::sync::Arc;
+use std::{
+    cmp,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use ckb_gen_types::packed::RelayMessage;
 use tokio::task::JoinHandle;
 
-use crate::node::SimulatedNode;
+use crate::{edge::NodeEdge, node::SimulatedNode};
 
 pub struct TimeUsageEvent {
     pub time_usage: usize,
+    #[allow(unused)]
     pub description: String,
 }
 
@@ -16,19 +21,27 @@ pub struct SimulatedTransaction {
 }
 
 pub struct MessageTransportSimulator {
-    pub nodes: Vec<Arc<SimulatedNode>>,
-    event_sender: tokio::sync::mpsc::Sender<TimeUsageEvent>,
-    pub event_receiver: tokio::sync::mpsc::Receiver<TimeUsageEvent>,
+    nodes: Vec<Arc<SimulatedNode>>,
+    event_sender: tokio::sync::mpsc::UnboundedSender<TimeUsageEvent>,
+    pub event_receiver: tokio::sync::mpsc::UnboundedReceiver<TimeUsageEvent>,
 }
 
 impl MessageTransportSimulator {
-    pub fn get_event_sender(&self) -> tokio::sync::mpsc::Sender<TimeUsageEvent> {
+    pub fn clone_nodes(&self) -> Vec<Arc<SimulatedNode>> {
+        self.nodes.clone()
+    }
+    pub fn get_node_count(&self) -> usize {
+        self.nodes.len()
+    }
+    pub fn get_event_sender(&self) -> tokio::sync::mpsc::UnboundedSender<TimeUsageEvent> {
         self.event_sender.clone()
     }
-    pub fn new() -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
+    pub fn new(node_count: usize) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            nodes: vec![],
+            nodes: (0..node_count)
+                .map(|i| Arc::new(SimulatedNode::new(i, tx.clone())))
+                .collect(),
             event_receiver: rx,
             event_sender: tx,
         }
@@ -39,9 +52,86 @@ impl MessageTransportSimulator {
             .map(|x| x.clone().start_worker())
             .collect()
     }
+    pub fn add_edge(&mut self, i: usize, j: usize, len: usize) {
+        self.nodes[j].add_edge(NodeEdge {
+            distance: len,
+            to_node: Arc::downgrade(&self.nodes[i]),
+            sender: self.nodes[i].get_message_sender(),
+            event_sender: self.get_event_sender(),
+        });
+        self.nodes[i].add_edge(NodeEdge {
+            distance: len,
+            to_node: Arc::downgrade(&self.nodes[j]),
+            sender: self.nodes[j].get_message_sender(),
+            event_sender: self.get_event_sender(),
+        });
+        log::info!("Add edge {:03} <-> {:03}, length = {}", i, j, len);
+    }
 }
 
 pub struct MessagePack {
     pub message: RelayMessage,
     pub source_node_index: usize,
+}
+
+#[derive(Eq, PartialEq, Clone)]
+pub struct UnknownTxHashPriority {
+    pub request_time: Instant,
+    pub peer_indexes: Vec<usize>,
+    pub requested: bool,
+}
+
+impl UnknownTxHashPriority {
+    pub fn should_request(&self, now: Instant) -> bool {
+        self.next_request_at() < now
+    }
+
+    pub fn next_request_at(&self) -> Instant {
+        if self.requested {
+            self.request_time + Duration::from_millis(100)
+        } else {
+            self.request_time
+        }
+    }
+
+    pub fn next_request_peer(&mut self) -> Option<usize> {
+        if self.requested {
+            if self.peer_indexes.len() > 1 {
+                self.request_time = Instant::now();
+                self.peer_indexes.swap_remove(0);
+                self.peer_indexes.first().cloned()
+            } else {
+                None
+            }
+        } else {
+            self.requested = true;
+            self.peer_indexes.first().cloned()
+        }
+    }
+
+    pub fn push_peer(&mut self, peer_index: usize) {
+        self.peer_indexes.push(peer_index);
+    }
+    #[allow(unused)]
+    pub fn requesting_peer(&self) -> Option<usize> {
+        if self.requested {
+            self.peer_indexes.first().cloned()
+        } else {
+            None
+        }
+    }
+}
+
+impl Ord for UnknownTxHashPriority {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.next_request_at()
+            .cmp(&other.next_request_at())
+            .reverse()
+    }
+}
+
+impl PartialOrd for UnknownTxHashPriority {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }

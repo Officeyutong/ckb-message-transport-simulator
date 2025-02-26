@@ -1,15 +1,15 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
     edge::NodeEdge,
-    util::{MessagePack, SimulatedTransaction, TimeUsageEvent},
+    util::{MessagePack, SimulatedTransaction, TimeUsageEvent, UnknownTxHashPriority},
 };
 use ckb_gen_types::{
-    packed::{Byte32, RelayMessage, RelayTransactionHashes},
+    packed::{Byte32, RelayMessage, RelayTransactionHashes, TransactionViewBuilder},
     prelude::{Entity, PackVec},
 };
 use ckb_gen_types::{
@@ -20,42 +20,51 @@ use ckb_gen_types::{
     packed::{RelayMessageUnionReader, RelayTransactionVec, RelayTransactions},
     prelude::Builder,
 };
-use rand::seq::SliceRandom;
+use keyed_priority_queue::KeyedPriorityQueue;
 use tokio::task::JoinHandle;
 
 pub struct SimulatedNode {
-    node_name: String,
     connected_nodes: std::sync::Mutex<Vec<NodeEdge>>,
     tx_pool: tokio::sync::RwLock<HashMap<Byte32, SimulatedTransaction>>,
-    event_sender: tokio::sync::mpsc::Sender<TimeUsageEvent>,
-    unknown_tx_hashes: tokio::sync::RwLock<HashSet<Byte32>>,
+    event_sender: tokio::sync::mpsc::UnboundedSender<TimeUsageEvent>,
+    unknown_tx_hashes: tokio::sync::RwLock<KeyedPriorityQueue<Byte32, UnknownTxHashPriority>>,
+
     message_sender: tokio::sync::mpsc::UnboundedSender<MessagePack>,
     message_receiver: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<MessagePack>>>,
+
     edge_index_map: std::sync::Mutex<HashMap<usize, usize>>,
     node_index: usize,
 }
 
 impl SimulatedNode {
+    pub fn get_tx_pool_size(&self) -> usize {
+        self.tx_pool.blocking_read().len()
+    }
+    pub fn add_transaction(&self, tx: SimulatedTransaction) {
+        let mut tx_pool = self.tx_pool.blocking_write();
+        tx_pool.insert(tx.tx.hash(), tx);
+    }
+    pub fn get_node_name(&self) -> String {
+        format!("node-{:03}", self.node_index)
+    }
     pub fn get_node_index(&self) -> usize {
         self.node_index
     }
     fn emit_event(&self, time_usage: usize, description: String) {
         self.event_sender
-            .try_send(TimeUsageEvent {
+            .send(TimeUsageEvent {
                 time_usage,
                 description,
             })
             .unwrap();
     }
     pub fn new(
-        node_name: impl AsRef<str>,
         node_index: usize,
-        event_sender: tokio::sync::mpsc::Sender<TimeUsageEvent>,
+        event_sender: tokio::sync::mpsc::UnboundedSender<TimeUsageEvent>,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         Self {
-            node_name: node_name.as_ref().to_string(),
             connected_nodes: Default::default(),
             tx_pool: Default::default(),
             event_sender,
@@ -74,7 +83,7 @@ impl SimulatedNode {
         self.edge_index_map
             .lock()
             .unwrap()
-            .insert(nodes.len() - 1, opposite_index);
+            .insert(opposite_index, nodes.len() - 1);
     }
     pub fn start_worker(
         self: Arc<SimulatedNode>,
@@ -84,22 +93,23 @@ impl SimulatedNode {
 
         let handle = tokio::spawn(async move {
             loop {
+                let new_self = self.clone();
                 tokio::select! {
                     _ = rx.recv() => {
-                        log::info!("Node {} exiting..",self.node_name);
+                        log::info!("Node {} exiting..",self.get_node_name());
                         break;
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(300)) => {
-                        log::info!("Node {} flooding..",self.node_name);
-                        self.flood_broadcast_hashes().await;
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        log::info!("Node {} flooding..",self.get_node_name());
+                        tokio::spawn(async move {    new_self.flood_broadcast_hashes().await});
 
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(300)) => {
-                        log::info!("Node {} requesting missing txs..",self.node_name);
-                        self.ask_for_missing_txs().await;
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        log::info!("Node {} requesting missing txs..",self.get_node_name());
+                       tokio::spawn(async move {new_self.ask_for_missing_txs().await});
                     }
                     Some(msg) = message_rx.recv() => {
-                        self.accept_message(msg.message,msg.source_node_index).await;
+                    tokio::spawn(async move {   new_self.accept_message(msg.message,msg.source_node_index).await});
                     }
                 }
             }
@@ -107,34 +117,85 @@ impl SimulatedNode {
         (handle, tx)
     }
 
+    fn pop_ask_for_txs(
+        &self,
+        unknown_tx_hashes: &mut KeyedPriorityQueue<Byte32, UnknownTxHashPriority>,
+    ) -> HashMap<usize, Vec<Byte32>> {
+        let mut result: HashMap<usize, Vec<Byte32>> = HashMap::new();
+        let now = Instant::now();
+
+        if !unknown_tx_hashes
+            .peek()
+            .map(|(_tx_hash, priority)| priority.should_request(now))
+            .unwrap_or_default()
+        {
+            return result;
+        }
+
+        while let Some((tx_hash, mut priority)) = unknown_tx_hashes.pop() {
+            if priority.should_request(now) {
+                if let Some(peer_index) = priority.next_request_peer() {
+                    result
+                        .entry(peer_index)
+                        .and_modify(|hashes| hashes.push(tx_hash.clone()))
+                        .or_insert_with(|| vec![tx_hash.clone()]);
+                    unknown_tx_hashes.push(tx_hash, priority);
+                }
+            } else {
+                unknown_tx_hashes.push(tx_hash, priority);
+                break;
+            }
+        }
+        result
+    }
+
     // Send GetRelayTransactions to connected peers, so we can retrive missing transactions
     // Encode and transport time overhead are accounted when sending messages
     // While decoding overhead are counted when receiving messages
     pub async fn ask_for_missing_txs(self: &Arc<Self>) {
-        let unknown_txs = self.unknown_tx_hashes.read().await;
+        log::debug!(
+            "Node {} entering ask_for_missing_txs..",
+            self.get_node_name()
+        );
+        let mut unknown_txs = self.unknown_tx_hashes.write().await;
         if unknown_txs.is_empty() {
-            log::info!("No need to ask for missing txs");
+            log::debug!("No need to ask for missing txs");
             return;
+        } else {
+            log::debug!(
+                "Node {} unknown_txs size = {}",
+                self.get_node_name(),
+                unknown_txs.len()
+            );
         }
-        let mut peers = self.connected_nodes.lock().unwrap().clone();
-        peers.shuffle(&mut rand::rng());
-        let tx_per_peer = unknown_txs.len().div_ceil(peers.len());
-        // Chunk missing transactions to every connected node
-        for chunk in unknown_txs.iter().collect::<Vec<_>>().chunks(tx_per_peer) {
-            let curr_peer = peers.pop().unwrap();
+        let request_list = self.pop_ask_for_txs(&mut *unknown_txs);
+        log::debug!(
+            "Node {} request list {:?}",
+            self.get_node_name(),
+            request_list
+        );
+        for (peer, txs) in request_list {
             let content = GetRelayTransactions::new_builder()
-                .tx_hashes(
-                    chunk
-                        .iter()
-                        .map(|x| (*x).clone())
-                        .collect::<Vec<_>>()
-                        .pack(),
-                )
+                .tx_hashes(txs.clone().pack())
                 .build();
             let message = RelayMessage::new_builder().set(content).build();
-            curr_peer
-                .send_message_through_edge(message, self.node_index)
-                .unwrap();
+            if let Some(curr_peer) = self.find_node_edge(peer) {
+                log::debug!(
+                    "{}: requesting missing txs {:?} from {}",
+                    self.get_node_name(),
+                    txs,
+                    curr_peer.to_node.upgrade().unwrap().get_node_name(),
+                );
+                curr_peer
+                    .send_message_through_edge(message, self.node_index)
+                    .unwrap();
+            } else {
+                log::warn!(
+                    "Node {} trying to send GetRelayTransactions to an unknown peer: {}",
+                    self.get_node_name(),
+                    peer
+                );
+            }
         }
     }
 
@@ -146,37 +207,68 @@ impl SimulatedNode {
     ) {
         self.emit_event(
             1000 * msg.as_slice().len(),
-            format!("Decoding RelayMessage at {}", self.node_name),
+            format!("Decoding RelayMessage at {}", self.get_node_name()),
         );
         match msg.as_reader().to_enum() {
             RelayMessageUnionReader::RelayTransactionHashes(reader) => {
                 // Receiving RelayTransactionHashes, record unknown tx hashes
-                log::info!("Node {} handling RelayTransactionHashes", self.node_name);
+                log::debug!(
+                    "Node {} handling RelayTransactionHashes (length = {})",
+                    self.get_node_name(),
+                    reader.tx_hashes().len()
+                );
+                let mut inserted_count = 0;
+                let tx_pool = self.tx_pool.read().await;
+                let mut unknown_tx = self.unknown_tx_hashes.write().await;
                 for hash in reader.tx_hashes().iter() {
-                    if !self
-                        .unknown_tx_hashes
-                        .read()
-                        .await
-                        .contains(&hash.to_entity())
-                    {}
+                    if tx_pool.contains_key(&hash.to_entity()) {
+                        continue;
+                    }
+                    match unknown_tx.entry(hash.to_entity()) {
+                        keyed_priority_queue::Entry::Occupied(entry) => {
+                            let mut priority = entry.get_priority().clone();
+                            priority.push_peer(source_node_index);
+                            entry.set_priority(priority);
+                        }
+                        keyed_priority_queue::Entry::Vacant(entry) => {
+                            entry.set_priority(UnknownTxHashPriority {
+                                request_time: Instant::now(),
+                                requested: false,
+                                peer_indexes: vec![source_node_index],
+                            });
+
+                            inserted_count += 1;
+                        }
+                    }
                 }
+                log::debug!(
+                    "Node {} added {} unknown txs",
+                    self.get_node_name(),
+                    inserted_count
+                );
             }
             RelayMessageUnionReader::GetRelayTransactions(reader) => {
                 // Receiving GetRelayTransactions, construct a RelayTransactions and send it back
-                log::info!("Node {} handling GetRelayTransactions", self.node_name);
-                let mut to_send_tx = vec![];
-                let tx_pool = self.tx_pool.write().await;
+                log::debug!(
+                    "Node {} handling GetRelayTransactions",
+                    self.get_node_name()
+                );
+                let to_send_tx = {
+                    let mut to_send_tx = vec![];
+                    let tx_pool = self.tx_pool.write().await;
 
-                for hash in reader.to_entity().tx_hashes().into_iter() {
-                    if let Some(v) = tx_pool.get(&hash) {
-                        to_send_tx.push(
-                            RelayTransaction::new_builder()
-                                .cycles((0_u64).pack())
-                                .transaction(v.tx.data())
-                                .build(),
-                        );
+                    for hash in reader.to_entity().tx_hashes().into_iter() {
+                        if let Some(v) = tx_pool.get(&hash) {
+                            to_send_tx.push(
+                                RelayTransaction::new_builder()
+                                    .cycles((0_u64).pack())
+                                    .transaction(v.tx.data())
+                                    .build(),
+                            );
+                        }
                     }
-                }
+                    to_send_tx
+                };
                 let message = RelayMessage::new_builder()
                     .set(
                         RelayTransactions::new_builder()
@@ -188,10 +280,46 @@ impl SimulatedNode {
                     .build();
 
                 if let Some(to_edge) = self.find_node_edge(source_node_index) {
+                    log::debug!(
+                        "Node {} sending {:?}(RelayTransactions) to {}",
+                        self.get_node_name(),
+                        message,
+                        to_edge.to_node.upgrade().unwrap().get_node_name()
+                    );
                     to_edge
                         .send_message_through_edge(message, self.node_index)
                         .unwrap();
+                } else {
+                    log::warn!(
+                        "Node {} can't find edge to {}",
+                        self.get_node_name(),
+                        source_node_index
+                    );
                 }
+            }
+            RelayMessageUnionReader::RelayTransactions(reader) => {
+                log::debug!("Node {} handling RelayTransactions", self.get_node_name());
+                let mut added_count = 0;
+                let mut tx_pool = self.tx_pool.write().await;
+                let mut unknown_tx_hashes = self.unknown_tx_hashes.write().await;
+
+                for tx in reader.to_entity().transactions().into_iter() {
+                    let tx_hash = tx.transaction().calc_tx_hash();
+                    unknown_tx_hashes.remove(&tx_hash);
+                    tx_pool.entry(tx_hash).or_insert_with(|| {
+                        added_count += 1;
+                        SimulatedTransaction {
+                            tx: TransactionViewBuilder::default()
+                                .data(tx.transaction())
+                                .build(),
+                        }
+                    });
+                }
+                log::info!(
+                    "Node {} received {} new txs",
+                    self.get_node_name(),
+                    added_count
+                );
             }
             _ => {}
         }
@@ -206,8 +334,33 @@ impl SimulatedNode {
             .map(|x| x.clone())
             .collect::<Vec<_>>();
         if hashes.is_empty() {
+            log::info!(
+                "Node {} won't flood, since it doesn't have any transactions",
+                self.get_node_name()
+            );
             return;
         }
+
+        log::info!(
+            "Node {} has {} known txs, {} unknown txs, flooding..",
+            self.get_node_name(),
+            self.tx_pool.read().await.len(),
+            self.unknown_tx_hashes.read().await.len(),
+        );
+
+        log::debug!(
+            "Node {} has {} known txs: {:?}, {} unknown txs: {:?}, flooding..",
+            self.get_node_name(),
+            self.tx_pool.read().await.len(),
+            self.tx_pool.read().await.keys().collect::<Vec<_>>(),
+            self.unknown_tx_hashes.read().await.len(),
+            self.unknown_tx_hashes
+                .read()
+                .await
+                .iter()
+                .map(|x| x.0)
+                .collect::<Vec<_>>(),
+        );
         let connected_nodes = self.connected_nodes.lock().unwrap().clone();
         for peer in connected_nodes.iter() {
             let content = RelayTransactionHashes::new_builder()
@@ -216,6 +369,12 @@ impl SimulatedNode {
             let message = RelayMessage::new_builder().set(content).build();
             peer.send_message_through_edge(message, self.node_index)
                 .unwrap();
+            log::debug!(
+                "Node {} flooded {} hashes to {}",
+                self.get_node_name(),
+                hashes.len(),
+                peer.to_node.upgrade().unwrap().get_node_name()
+            );
         }
     }
     pub fn get_message_sender(&self) -> tokio::sync::mpsc::UnboundedSender<MessagePack> {

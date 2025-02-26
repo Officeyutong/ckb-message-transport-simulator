@@ -12,17 +12,17 @@ pub struct NodeEdge {
     pub distance: usize,
     pub to_node: Weak<SimulatedNode>,
     pub sender: tokio::sync::mpsc::UnboundedSender<MessagePack>,
-    pub event_sender: tokio::sync::mpsc::Sender<TimeUsageEvent>,
+    pub event_sender: tokio::sync::mpsc::UnboundedSender<TimeUsageEvent>,
 }
 
 impl NodeEdge {
     fn emit_event(&self, time_usage: usize, description: String) {
         self.event_sender
-            .try_send(TimeUsageEvent {
+            .send(TimeUsageEvent {
                 time_usage,
                 description,
             })
-            .unwrap();
+            .ok();
     }
 
     pub fn send_message_through_edge(
@@ -43,7 +43,7 @@ impl NodeEdge {
         let time_usage = self.distance * 1000_000 / 10 + message_length * 1000;
         if let Ok(_) = self.sender.send(MessagePack {
             message: msg,
-            source_node_index: to_node_idx,
+            source_node_index: source_index,
         }) {
             self.emit_event(
                 time_usage,
