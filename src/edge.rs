@@ -4,7 +4,7 @@ use ckb_gen_types::packed::RelayMessage;
 
 use crate::{
     node::SimulatedNode,
-    util::{MessagePack, TimeUsageEvent},
+    util::{Event, MessagePack},
 };
 use ckb_gen_types::prelude::Entity;
 #[derive(Clone)]
@@ -12,17 +12,25 @@ pub struct NodeEdge {
     pub distance: usize,
     pub to_node: Weak<SimulatedNode>,
     pub sender: tokio::sync::mpsc::UnboundedSender<MessagePack>,
-    pub event_sender: tokio::sync::mpsc::UnboundedSender<TimeUsageEvent>,
+    pub event_sender: tokio::sync::mpsc::UnboundedSender<Event>,
 }
 
 impl NodeEdge {
-    fn emit_event(&self, time_usage: usize, description: String) {
+    fn emit_time_usage_event(&self, time_usage: usize, description: String) {
         self.event_sender
-            .send(TimeUsageEvent {
+            .send(Event::TimeUsage {
                 time_usage,
                 description,
             })
-            .ok();
+            .unwrap();
+    }
+    pub fn emit_data_usage_event(&self, data_usage: usize, description: String) {
+        self.event_sender
+            .send(Event::DataUsage {
+                bytes_usage: data_usage,
+                description,
+            })
+            .unwrap();
     }
 
     pub fn send_message_through_edge(
@@ -31,7 +39,7 @@ impl NodeEdge {
         source_index: usize,
     ) -> anyhow::Result<()> {
         let to_node_idx = self.to_node.upgrade().unwrap().get_node_index();
-        self.emit_event(
+        self.emit_time_usage_event(
             1000 * msg.as_slice().len(),
             format!(
                 "Encoding message overhead from {:03} to {:03}",
@@ -45,8 +53,15 @@ impl NodeEdge {
             message: msg,
             source_node_index: source_index,
         }) {
-            self.emit_event(
+            self.emit_time_usage_event(
                 time_usage,
+                format!(
+                    "Message transport overhead from {} to {}",
+                    source_index, to_node_idx
+                ),
+            );
+            self.emit_data_usage_event(
+                message_length,
                 format!(
                     "Message transport overhead from {} to {}",
                     source_index, to_node_idx

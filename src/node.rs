@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     edge::NodeEdge,
-    util::{MessagePack, SimulatedTransaction, TimeUsageEvent, UnknownTxHashPriority},
+    util::{Event, MessagePack, SimulatedTransaction, UnknownTxHashPriority},
 };
 use ckb_gen_types::{
     packed::{Byte32, RelayMessage, RelayTransactionHashes, TransactionViewBuilder},
@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 pub struct SimulatedNode {
     connected_nodes: std::sync::Mutex<Vec<NodeEdge>>,
     tx_pool: tokio::sync::RwLock<HashMap<Byte32, SimulatedTransaction>>,
-    event_sender: tokio::sync::mpsc::UnboundedSender<TimeUsageEvent>,
+    event_sender: tokio::sync::mpsc::UnboundedSender<Event>,
     unknown_tx_hashes: tokio::sync::RwLock<KeyedPriorityQueue<Byte32, UnknownTxHashPriority>>,
 
     message_sender: tokio::sync::mpsc::UnboundedSender<MessagePack>,
@@ -50,18 +50,15 @@ impl SimulatedNode {
     pub fn get_node_index(&self) -> usize {
         self.node_index
     }
-    fn emit_event(&self, time_usage: usize, description: String) {
+    fn emit_time_usage_event(&self, time_usage: usize, description: String) {
         self.event_sender
-            .send(TimeUsageEvent {
+            .send(Event::TimeUsage {
                 time_usage,
                 description,
             })
             .unwrap();
     }
-    pub fn new(
-        node_index: usize,
-        event_sender: tokio::sync::mpsc::UnboundedSender<TimeUsageEvent>,
-    ) -> Self {
+    pub fn new(node_index: usize, event_sender: tokio::sync::mpsc::UnboundedSender<Event>) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         Self {
@@ -205,7 +202,7 @@ impl SimulatedNode {
         msg: RelayMessage,
         source_node_index: usize,
     ) {
-        self.emit_event(
+        self.emit_time_usage_event(
             1000 * msg.as_slice().len(),
             format!("Decoding RelayMessage at {}", self.get_node_name()),
         );

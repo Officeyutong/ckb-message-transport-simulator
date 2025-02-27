@@ -9,10 +9,17 @@ use tokio::task::JoinHandle;
 
 use crate::{edge::NodeEdge, node::SimulatedNode};
 
-pub struct TimeUsageEvent {
-    pub time_usage: usize,
-    #[allow(unused)]
-    pub description: String,
+pub enum Event {
+    TimeUsage {
+        time_usage: usize,
+        #[allow(unused)]
+        description: String,
+    },
+    DataUsage {
+        bytes_usage: usize,
+        #[allow(unused)]
+        description: String,
+    },
 }
 
 #[derive(Clone)]
@@ -22,8 +29,8 @@ pub struct SimulatedTransaction {
 
 pub struct MessageTransportSimulator {
     nodes: Vec<Arc<SimulatedNode>>,
-    event_sender: tokio::sync::mpsc::UnboundedSender<TimeUsageEvent>,
-    pub event_receiver: tokio::sync::mpsc::UnboundedReceiver<TimeUsageEvent>,
+    event_sender: tokio::sync::mpsc::UnboundedSender<Event>,
+    pub event_receiver: tokio::sync::mpsc::UnboundedReceiver<Event>,
 }
 
 impl MessageTransportSimulator {
@@ -33,7 +40,7 @@ impl MessageTransportSimulator {
     pub fn get_node_count(&self) -> usize {
         self.nodes.len()
     }
-    pub fn get_event_sender(&self) -> tokio::sync::mpsc::UnboundedSender<TimeUsageEvent> {
+    pub fn get_event_sender(&self) -> tokio::sync::mpsc::UnboundedSender<Event> {
         self.event_sender.clone()
     }
     pub fn new(node_count: usize) -> Self {

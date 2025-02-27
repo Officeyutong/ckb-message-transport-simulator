@@ -17,7 +17,7 @@ mod util;
 
 const NODE_COUNT: usize = 10;
 const TX_COUNT: usize = 100;
-const EDGE_COUNT: usize = 30;
+const EDGE_COUNT: usize = 40;
 
 const GRAPH_SEED: u64 = 0xDEADBEEF;
 const TX_SEED: u64 = 0xCAFEBABE;
@@ -66,114 +66,133 @@ fn create_random_transaction(rng: &mut impl Rng) -> SimulatedTransaction {
 
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 
+const TRY_TIMES: usize = 40;
+
 fn main() -> anyhow::Result<()> {
     flexi_logger::Logger::try_with_env_or_str("info")
         .unwrap()
         .log_to_stdout()
         .start()
         .unwrap();
+    let mut result = vec![];
+    for _ in 0..TRY_TIMES {
+        let mut sim = MessageTransportSimulator::new(NODE_COUNT);
 
-    let mut sim = MessageTransportSimulator::new(NODE_COUNT);
-
-    {
-        let mut added_edges = HashSet::<(usize, usize)>::new();
-        // Each node connects to a node with a smaller index, so the node network can form a tree
-        let mut rng = ChaCha12Rng::seed_from_u64(GRAPH_SEED);
-        for i in 1..NODE_COUNT {
-            let to_idx = rng.random_range(0..i);
-            let rand_len: usize = rng.random_range(100..1000);
-            sim.add_edge(i, to_idx, rand_len);
-            added_edges.insert((to_idx, i));
-        }
-        // Add some random edges..
-        while added_edges.len() < EDGE_COUNT {
-            let a = rng.random_range(0..sim.get_node_count() - 1);
-            let b = rng.random_range(a + 1..sim.get_node_count());
-            let rand_len: usize = rng.random_range(100..1000);
-            if !added_edges.contains(&(a, b)) {
-                sim.add_edge(a, b, rand_len);
-                added_edges.insert((a, b));
-            } else {
-                continue;
+        {
+            let mut added_edges = HashSet::<(usize, usize)>::new();
+            // Each node connects to a node with a smaller index, so the node network can form a tree
+            let mut rng = ChaCha12Rng::seed_from_u64(GRAPH_SEED);
+            for i in 1..NODE_COUNT {
+                let to_idx = rng.random_range(0..i);
+                let rand_len: usize = rng.random_range(100..1000);
+                sim.add_edge(i, to_idx, rand_len);
+                added_edges.insert((to_idx, i));
             }
-        }
-    }
-
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(48)
-        .build()?;
-
-    let _guard = runtime.enter();
-
-    // Start workers
-    let handles_and_senders = sim.start_workers();
-
-    let mut monitor_rx = {
-        let (monitor_tx, monitor_rx) = tokio::sync::mpsc::channel(1);
-
-        let nodes = sim.clone_nodes();
-        tokio::task::spawn_blocking(move || {
-            while !nodes.iter().all(|x| x.get_tx_pool_size() == TX_COUNT) {
-                std::thread::sleep(Duration::from_millis(300));
-                if SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
-                    return;
+            // Add some random edges..
+            while added_edges.len() < EDGE_COUNT {
+                let a = rng.random_range(0..sim.get_node_count() - 1);
+                let b = rng.random_range(a + 1..sim.get_node_count());
+                let rand_len: usize = rng.random_range(100..1000);
+                if !added_edges.contains(&(a, b)) {
+                    sim.add_edge(a, b, rand_len);
+                    added_edges.insert((a, b));
+                } else {
+                    continue;
                 }
             }
-            log::info!("Check passed..");
-            monitor_tx.try_send(()).unwrap();
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(48)
+            .build()?;
+
+        let _guard = runtime.enter();
+
+        // Start workers
+        let handles_and_senders = sim.start_workers();
+
+        let mut monitor_rx = {
+            let (monitor_tx, monitor_rx) = tokio::sync::mpsc::channel(1);
+
+            let nodes = sim.clone_nodes();
+            tokio::task::spawn_blocking(move || {
+                while !nodes.iter().all(|x| x.get_tx_pool_size() == TX_COUNT) {
+                    std::thread::sleep(Duration::from_millis(300));
+                    if SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                }
+                log::info!("Check passed..");
+                monitor_tx.try_send(()).unwrap();
+            });
+
+            monitor_rx
+        };
+
+        // Setup some transactions..
+        let tx_creator = {
+            let nodes = sim.clone_nodes();
+            std::thread::spawn(move || {
+                let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(TX_SEED);
+                for _ in 0..TX_COUNT {
+                    let selected_node = nodes.choose(&mut rng).unwrap();
+                    selected_node.add_transaction(create_random_transaction(&mut rng));
+                    if SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                }
+                log::info!("Transaction generating done");
+            })
+        };
+        let events = runtime.block_on(async move {
+            let mut evts = vec![];
+            loop {
+                tokio::select! {
+                    _ = monitor_rx.recv() => {
+                        log::info!("All nodes satisfied, exiting..");
+                        break;
+                    }
+                    Some(evt) = sim.event_receiver.recv() => {
+                        evts.push(evt);
+                    }
+                    Ok(_) = tokio::signal::ctrl_c() => {
+                        log::info!("Ctrl+C pressed, exiting..");
+                        SHOULD_EXIT.store(true,std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
+            for (_, sender) in handles_and_senders.iter() {
+                sender.send(()).await.unwrap();
+            }
+            for (handle, _) in handles_and_senders.into_iter() {
+                handle.await.unwrap();
+            }
+            evts
         });
 
-        monitor_rx
-    };
+        tx_creator.join().unwrap();
+        if SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        let curr_result = events
+            .iter()
+            .map(|x| match x {
+                util::Event::TimeUsage { time_usage, .. } => (*time_usage, 0),
+                util::Event::DataUsage { bytes_usage, .. } => (0, *bytes_usage),
+            })
+            .fold((0, 0), |x, y| (x.0 + y.0, x.1 + y.1));
+        log::info!(
+            "Collected {} events, (time usage, data usage): {:?}",
+            events.len(),
+            curr_result
+        );
+        result.push(curr_result);
+    }
+    let (total_time, total_data) = result.iter().fold((0, 0), |x, y| (x.0 + y.0, x.1 + y.1));
+    log::info!("Average time usage: {}", total_time / result.len());
+    log::info!("Average data usage: {}", total_data / result.len());
 
-    // Setup some transactions..
-    let tx_creator = {
-        let nodes = sim.clone_nodes();
-        std::thread::spawn(move || {
-            let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(TX_SEED);
-            for _ in 0..TX_COUNT {
-                let selected_node = nodes.choose(&mut rng).unwrap();
-                selected_node.add_transaction(create_random_transaction(&mut rng));
-                if SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
-                    return;
-                }
-            }
-            log::info!("Transaction generating done");
-        })
-    };
-    let events = runtime.block_on(async move {
-        let mut evts = vec![];
-        loop {
-            tokio::select! {
-                _ = monitor_rx.recv() => {
-                    log::info!("All nodes satisfied, exiting..");
-                    break;
-                }
-                Some(evt) = sim.event_receiver.recv() => {
-                    evts.push(evt);
-                }
-                Ok(_) = tokio::signal::ctrl_c() => {
-                    log::info!("Ctrl+C pressed, exiting..");
-                    SHOULD_EXIT.store(true,std::sync::atomic::Ordering::SeqCst);
-                    break;
-                }
-            }
-        }
-        for (_, sender) in handles_and_senders.iter() {
-            sender.send(()).await.unwrap();
-        }
-        for (handle, _) in handles_and_senders.into_iter() {
-            handle.await.unwrap();
-        }
-        evts
-    });
-
-    tx_creator.join().unwrap();
-    log::info!(
-        "Collected {} events, total time usage: {}",
-        events.len(),
-        events.iter().map(|x| x.time_usage).sum::<usize>()
-    );
     Ok(())
 }
