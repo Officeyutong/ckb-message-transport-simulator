@@ -6,11 +6,15 @@ use std::{
 
 use crate::{
     edge::NodeEdge,
+    erlay::{ErlaySessionForRequester, ErlaySessionForResponder},
     util::{Event, MessagePack, SimulatedTransaction, UnknownTxHashPriority},
 };
 use ckb_gen_types::{
-    packed::{Byte32, RelayMessage, RelayTransactionHashes, TransactionViewBuilder},
-    prelude::{Entity, PackVec},
+    packed::{
+        Byte32, RelayMessage, RelayMessageUnion, RelayTransactionHashes, RelayTransactionSalt,
+        TransactionViewBuilder,
+    },
+    prelude::{Entity, PackVec, Unpack},
 };
 use ckb_gen_types::{
     packed::{GetRelayTransactions, RelayTransaction},
@@ -21,8 +25,14 @@ use ckb_gen_types::{
     prelude::Builder,
 };
 use keyed_priority_queue::KeyedPriorityQueue;
+use minisketch_rs::Minisketch;
 use tokio::task::JoinHandle;
 
+#[derive(Default, Clone)]
+pub struct NodeConfig {
+    pub enable_hash_flood: bool,
+    pub enable_erlay: bool,
+}
 pub struct SimulatedNode {
     connected_nodes: std::sync::Mutex<Vec<NodeEdge>>,
     tx_pool: tokio::sync::RwLock<HashMap<Byte32, SimulatedTransaction>>,
@@ -34,6 +44,14 @@ pub struct SimulatedNode {
 
     edge_index_map: std::sync::Mutex<HashMap<usize, usize>>,
     node_index: usize,
+
+    erlay_short_id_salt: u64,
+    salts_of_other_nodes: tokio::sync::RwLock<HashMap<usize, u64>>,
+
+    erlay_requester_sessions: tokio::sync::RwLock<HashMap<usize, ErlaySessionForRequester>>,
+    erlay_responder_sessions: tokio::sync::RwLock<HashMap<usize, ErlaySessionForResponder>>,
+
+    config: NodeConfig,
 }
 
 impl SimulatedNode {
@@ -58,7 +76,12 @@ impl SimulatedNode {
             })
             .unwrap();
     }
-    pub fn new(node_index: usize, event_sender: tokio::sync::mpsc::UnboundedSender<Event>) -> Self {
+    pub fn new(
+        node_index: usize,
+        event_sender: tokio::sync::mpsc::UnboundedSender<Event>,
+        erlay_short_id_salt: u64,
+        config: NodeConfig,
+    ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         Self {
@@ -70,6 +93,11 @@ impl SimulatedNode {
             message_sender: tx,
             edge_index_map: Default::default(),
             node_index,
+            erlay_short_id_salt,
+            salts_of_other_nodes: Default::default(),
+            erlay_requester_sessions: Default::default(),
+            erlay_responder_sessions: Default::default(),
+            config,
         }
     }
     pub fn add_edge(&self, edge: NodeEdge) {
@@ -82,12 +110,30 @@ impl SimulatedNode {
             .unwrap()
             .insert(opposite_index, nodes.len() - 1);
     }
+    fn broadcast_erlay_salt(&self) {
+        log::debug!(
+            "Node {} broadcasting erlay salt to all nodes",
+            self.get_node_index()
+        );
+        let conected_nodes = self.connected_nodes.lock().unwrap().clone();
+        let message = RelayMessage::new_builder()
+            .set(
+                RelayTransactionSalt::new_builder()
+                    .salt(self.erlay_short_id_salt.pack())
+                    .build(),
+            )
+            .build();
+        for node in conected_nodes.into_iter() {
+            node.send_message_through_edge(message.clone(), self.get_node_index())
+                .unwrap();
+        }
+    }
     pub fn start_worker(
         self: Arc<SimulatedNode>,
     ) -> (JoinHandle<()>, tokio::sync::mpsc::Sender<()>) {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let mut message_rx = self.message_receiver.lock().unwrap().take().unwrap();
-
+        self.broadcast_erlay_salt();
         let handle = tokio::spawn(async move {
             loop {
                 let new_self = self.clone();
@@ -97,16 +143,23 @@ impl SimulatedNode {
                         break;
                     }
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                        log::info!("Node {} flooding..",self.get_node_name());
-                        tokio::spawn(async move {    new_self.flood_broadcast_hashes().await});
+                        if new_self.config.enable_hash_flood {
+                            log::info!("Node {} flooding..",self.get_node_name());
+                            tokio::spawn(async move {    new_self.flood_broadcast_hashes().await});
+                        }
 
                     }
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {
                         log::info!("Node {} requesting missing txs..",self.get_node_name());
-                       tokio::spawn(async move {new_self.ask_for_missing_txs().await});
+                        tokio::spawn(async move {new_self.ask_for_missing_txs().await});
                     }
                     Some(msg) = message_rx.recv() => {
-                    tokio::spawn(async move {   new_self.accept_message(msg.message,msg.source_node_index).await});
+                        tokio::spawn(async move {   new_self.accept_message(msg.message,msg.source_node_index).await});
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                        if new_self.config.enable_erlay {
+                            tokio::task::spawn_blocking(move || new_self.broadcast_erlay_salt());
+                        }
                     }
                 }
             }
@@ -317,6 +370,75 @@ impl SimulatedNode {
                     self.get_node_name(),
                     added_count
                 );
+            }
+            RelayMessageUnionReader::RelayTransactionSalt(reader) => {
+                log::debug!(
+                    "Node {} handling RelayTransactionSalt",
+                    self.get_node_index()
+                );
+                let salt: u64 = reader.salt().to_entity().unpack();
+                log::debug!(
+                    "Node {} recorded salt {} from node {}",
+                    self.get_node_index(),
+                    salt,
+                    source_node_index
+                );
+                self.salts_of_other_nodes
+                    .write()
+                    .await
+                    .insert(source_node_index, salt);
+            }
+            RelayMessageUnionReader::GetRelayTransactionSketch(reader) => {
+                log::debug!(
+                    "Node {} handling GetRelayTransactionSketch",
+                    self.get_node_index()
+                );
+                let mut responder_session = self.erlay_responder_sessions.write().await;
+                let session = match responder_session.entry(source_node_index) {
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        log::warn!(
+                            "Node {}: There is already a responder session from source node {}",
+                            self.get_node_index(),
+                            source_node_index
+                        );
+                        return;
+                    }
+                    std::collections::hash_map::Entry::Vacant(vacant_entry) => {
+                        vacant_entry.insert(ErlaySessionForResponder::new(
+                            self.erlay_short_id_salt,
+                            *self
+                                .salts_of_other_nodes
+                                .read()
+                                .await
+                                .get(&source_node_index)
+                                .unwrap(),
+                            self.tx_pool.read().await.clone(),
+                        ))
+                    }
+                };
+                let local_set_size = session.snapshot().len() as u64;
+                let remote_set_size: u64 = reader.set_size().unpack();
+                let u64_q: u64 = reader.q().unpack();
+                let f64_q: f64 = f64::from_le_bytes(u64_q.to_le_bytes());
+                // |remote_set_size-local_set_size|+q*min(remote_set_size,local_set_size)+1
+                let expected_set_size = ((local_set_size.abs_diff(remote_set_size) as f64)
+                    + f64_q * (remote_set_size.min(local_set_size) as f64)
+                    + 1f64) as usize;
+                log::debug!(
+                    "Node {} expected set size {}",
+                    self.get_node_index(),
+                    expected_set_size
+                );
+                let mut sketch = Minisketch::try_new(32, 0, expected_set_size).unwrap();
+                for key in session.iter_short_ids() {
+                    sketch.add(*key as u64);
+                }
+                let sketch_buf = {
+                    let mut buf = vec![0u8; sketch.serialized_size()];
+                    sketch.serialize(&mut buf).unwrap();
+                    buf
+                };
+                // sketch.serialize(buf)
             }
             _ => {}
         }

@@ -11,7 +11,9 @@ use rand::seq::IndexedRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use util::{MessageTransportSimulator, SimulatedTransaction};
+
 mod edge;
+mod erlay;
 mod node;
 mod util;
 
@@ -21,6 +23,7 @@ const EDGE_COUNT: usize = 40;
 
 const GRAPH_SEED: u64 = 0xDEADBEEF;
 const TX_SEED: u64 = 0xCAFEBABE;
+const ERLAY_SALT_SEED: u64 = 0x12345678;
 fn rand_byte32(rng: &mut impl Rng) -> Byte32 {
     let mut rand_data: [Byte; 32] = Default::default();
     for item in rand_data.iter_mut() {
@@ -76,7 +79,14 @@ fn main() -> anyhow::Result<()> {
         .unwrap();
     let mut result = vec![];
     for _ in 0..TRY_TIMES {
-        let mut sim = MessageTransportSimulator::new(NODE_COUNT);
+        let mut sim = MessageTransportSimulator::new(
+            NODE_COUNT,
+            ERLAY_SALT_SEED,
+            node::NodeConfig {
+                enable_hash_flood: true,
+                enable_erlay: false,
+            },
+        );
 
         {
             let mut added_edges = HashSet::<(usize, usize)>::new();

@@ -5,9 +5,13 @@ use std::{
 };
 
 use ckb_gen_types::packed::RelayMessage;
+use rand::{Rng, SeedableRng};
 use tokio::task::JoinHandle;
 
-use crate::{edge::NodeEdge, node::SimulatedNode};
+use crate::{
+    edge::NodeEdge,
+    node::{NodeConfig, SimulatedNode},
+};
 
 pub enum Event {
     TimeUsage {
@@ -43,11 +47,19 @@ impl MessageTransportSimulator {
     pub fn get_event_sender(&self) -> tokio::sync::mpsc::UnboundedSender<Event> {
         self.event_sender.clone()
     }
-    pub fn new(node_count: usize) -> Self {
+    pub fn new(node_count: usize, erlay_salt_seed: u64, node_config: NodeConfig) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(erlay_salt_seed);
         Self {
             nodes: (0..node_count)
-                .map(|i| Arc::new(SimulatedNode::new(i, tx.clone())))
+                .map(|i| {
+                    Arc::new(SimulatedNode::new(
+                        i,
+                        tx.clone(),
+                        rng.random(),
+                        node_config.clone(),
+                    ))
+                })
                 .collect(),
             event_receiver: rx,
             event_sender: tx,
