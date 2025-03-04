@@ -174,7 +174,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             for (_, sender) in handles_and_senders.iter() {
-                sender.send(()).await.unwrap();
+                sender.send(true).unwrap();
             }
             for (handle, _) in handles_and_senders.into_iter() {
                 handle.await.unwrap();

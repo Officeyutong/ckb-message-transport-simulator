@@ -65,10 +65,10 @@ impl MessageTransportSimulator {
             event_sender: tx,
         }
     }
-    pub fn start_workers(&self) -> Vec<(JoinHandle<()>, tokio::sync::mpsc::Sender<()>)> {
+    pub fn start_workers(&self) -> Vec<(JoinHandle<()>, tokio::sync::watch::Sender<bool>)> {
         self.nodes
             .iter()
-            .map(|x| x.clone().start_worker())
+            .map(|x| x.clone().start_all_workers())
             .collect()
     }
     pub fn add_edge(&mut self, i: usize, j: usize, len: usize) {
