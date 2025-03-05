@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ckb_gen_types::packed::{
     Byte, Byte32, Byte32Builder, CellInputBuilder, CellOutputBuilder, OutPointBuilder,
@@ -19,7 +19,7 @@ mod util;
 
 const NODE_COUNT: usize = 10;
 const TX_COUNT: usize = 100;
-const EDGE_COUNT: usize = 40;
+const EDGE_COUNT: usize = 30;
 
 const GRAPH_SEED: u64 = 0xDEADBEEF;
 const TX_SEED: u64 = 0xCAFEBABE;
@@ -69,7 +69,7 @@ fn create_random_transaction(rng: &mut impl Rng) -> SimulatedTransaction {
 
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 
-const TRY_TIMES: usize = 40;
+const TRY_TIMES: usize = 10;
 
 fn main() -> anyhow::Result<()> {
     flexi_logger::Logger::try_with_env_or_str("info")
@@ -83,8 +83,9 @@ fn main() -> anyhow::Result<()> {
             NODE_COUNT,
             ERLAY_SALT_SEED,
             node::NodeConfig {
-                enable_hash_flood: true,
-                enable_erlay: false,
+                enable_hash_flood: false,
+                enable_erlay: true,
+                enable_real_time_simulation: true,
             },
         );
 
@@ -118,7 +119,7 @@ fn main() -> anyhow::Result<()> {
             .build()?;
 
         let _guard = runtime.enter();
-
+        let start_time = Instant::now();
         // Start workers
         let handles_and_senders = sim.start_workers();
 
@@ -193,16 +194,25 @@ fn main() -> anyhow::Result<()> {
                 util::Event::DataUsage { bytes_usage, .. } => (0, *bytes_usage),
             })
             .fold((0, 0), |x, y| (x.0 + y.0, x.1 + y.1));
+
+        let time_consumed = start_time.elapsed().as_nanos();
         log::info!(
-            "Collected {} events, (time usage, data usage): {:?}",
+            "Collected {} events, (time usage, data usage, real_time_usage): {:?}",
             events.len(),
             curr_result
         );
-        result.push(curr_result);
+
+        result.push((curr_result.0, curr_result.1, time_consumed));
     }
-    let (total_time, total_data) = result.iter().fold((0, 0), |x, y| (x.0 + y.0, x.1 + y.1));
+    let (total_time, total_data, total_real_time) = result
+        .iter()
+        .fold((0, 0, 0), |x, y| (x.0 + y.0, x.1 + y.1, x.2 + y.2));
     log::info!("Average time usage: {}", total_time / result.len());
     log::info!("Average data usage: {}", total_data / result.len());
+    log::info!(
+        "Average real time usage: {}",
+        total_real_time / result.len() as u128
+    );
 
     Ok(())
 }

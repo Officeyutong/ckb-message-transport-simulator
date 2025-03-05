@@ -1,3 +1,5 @@
 /target
 /dump*
 /testdata*
+/erlay-test.txt
+*test.txt

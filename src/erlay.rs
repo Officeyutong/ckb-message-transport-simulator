@@ -23,6 +23,12 @@ impl ErlaySession {
         for key in snapshot.keys() {
             short_id_mapper.insert(hasher.hash(&Unpack::<[u8; 32]>::unpack(key)), key.clone());
         }
+        log::debug!(
+            "Erlay session initializer, short_id_mapper={:?}, tx snapshot = {:?}",
+            short_id_mapper,
+            snapshot.keys().collect::<Vec<_>>()
+        );
+
         Self {
             // short_id_hasher: hasher,
             short_id_mapper,
@@ -42,6 +48,9 @@ pub struct ErlaySessionForRequester {
 }
 
 impl ErlaySessionForRequester {
+    pub fn short_id_mapper(&self) -> &HashMap<u32, Byte32> {
+        &self.session.short_id_mapper
+    }
     pub fn snapshot_set_size(&self) -> usize {
         self.session.snapshot.len()
     }

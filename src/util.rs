@@ -35,6 +35,7 @@ pub struct MessageTransportSimulator {
     nodes: Vec<Arc<SimulatedNode>>,
     event_sender: tokio::sync::mpsc::UnboundedSender<Event>,
     pub event_receiver: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    node_config: Arc<NodeConfig>,
 }
 
 impl MessageTransportSimulator {
@@ -50,6 +51,7 @@ impl MessageTransportSimulator {
     pub fn new(node_count: usize, erlay_salt_seed: u64, node_config: NodeConfig) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(erlay_salt_seed);
+        let config = Arc::new(node_config);
         Self {
             nodes: (0..node_count)
                 .map(|i| {
@@ -57,12 +59,13 @@ impl MessageTransportSimulator {
                         i,
                         tx.clone(),
                         rng.random(),
-                        node_config.clone(),
+                        config.clone(),
                     ))
                 })
                 .collect(),
             event_receiver: rx,
             event_sender: tx,
+            node_config: config,
         }
     }
     pub fn start_workers(&self) -> Vec<(JoinHandle<()>, tokio::sync::watch::Sender<bool>)> {
@@ -77,12 +80,14 @@ impl MessageTransportSimulator {
             to_node: Arc::downgrade(&self.nodes[i]),
             sender: self.nodes[i].get_message_sender(),
             event_sender: self.get_event_sender(),
+            config: self.node_config.clone(),
         });
         self.nodes[i].add_edge(NodeEdge {
             distance: len,
             to_node: Arc::downgrade(&self.nodes[j]),
             sender: self.nodes[j].get_message_sender(),
             event_sender: self.get_event_sender(),
+            config: self.node_config.clone(),
         });
         log::info!("Add edge {:03} <-> {:03}, length = {}", i, j, len);
     }

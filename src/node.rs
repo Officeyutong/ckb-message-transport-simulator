@@ -37,6 +37,7 @@ use tokio::task::JoinHandle;
 pub struct NodeConfig {
     pub enable_hash_flood: bool,
     pub enable_erlay: bool,
+    pub enable_real_time_simulation: bool,
 }
 pub struct SimulatedNode {
     connected_nodes: std::sync::Mutex<Vec<NodeEdge>>,
@@ -56,7 +57,7 @@ pub struct SimulatedNode {
     erlay_responder_sessions: tokio::sync::RwLock<HashMap<usize, ErlaySessionForResponder>>,
     erlay_q: tokio::sync::Mutex<f64>,
 
-    config: NodeConfig,
+    config: Arc<NodeConfig>,
 }
 
 impl SimulatedNode {
@@ -73,19 +74,22 @@ impl SimulatedNode {
     pub fn get_node_index(&self) -> usize {
         self.node_index
     }
-    fn emit_time_usage_event(&self, time_usage: usize, description: String) {
+    async fn emit_time_usage_event(&self, time_usage: usize, description: String) {
         self.event_sender
             .send(Event::TimeUsage {
                 time_usage,
                 description,
             })
             .unwrap();
+        if self.config.enable_real_time_simulation {
+            tokio::time::sleep(Duration::from_nanos(time_usage as u64)).await;
+        }
     }
     pub fn new(
         node_index: usize,
         event_sender: tokio::sync::mpsc::UnboundedSender<Event>,
         erlay_short_id_salt: u64,
-        config: NodeConfig,
+        config: Arc<NodeConfig>,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -116,7 +120,7 @@ impl SimulatedNode {
             .unwrap()
             .insert(opposite_index, nodes.len() - 1);
     }
-    fn broadcast_erlay_salt(&self) {
+    async fn broadcast_erlay_salt(&self) {
         log::info!(
             "Node {} broadcasting erlay salt to all nodes",
             self.get_node_index()
@@ -131,6 +135,7 @@ impl SimulatedNode {
             .build();
         for node in conected_nodes.into_iter() {
             node.send_message_through_edge(message.clone(), self.get_node_index())
+                .await
                 .unwrap();
         }
     }
@@ -139,9 +144,14 @@ impl SimulatedNode {
     ) -> (JoinHandle<()>, tokio::sync::watch::Sender<bool>) {
         let (tx, rx) = tokio::sync::watch::channel(false);
         let mut message_rx = self.message_receiver.lock().unwrap().take().unwrap();
-        if self.config.enable_erlay {
-            self.broadcast_erlay_salt();
-        }
+        let start_salt_broadcastor = if self.config.enable_erlay {
+            let new_self = self.clone();
+            Some(tokio::spawn(async move {
+                new_self.broadcast_erlay_salt().await;
+            }))
+        } else {
+            None
+        };
         let transaction_asker = {
             let new_self = self.clone();
             let mut new_rx = rx.clone();
@@ -209,7 +219,7 @@ impl SimulatedNode {
                         }
 
                         _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                            new_self.broadcast_erlay_salt();
+                            new_self.broadcast_erlay_salt().await;
                         }
                     }
                 }
@@ -228,7 +238,7 @@ impl SimulatedNode {
                             break;
                         }
 
-                        _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {
                             new_self.start_erlay_session_with_all_connected_nodes().await
                         }
                     }
@@ -249,6 +259,9 @@ impl SimulatedNode {
                 v.await.unwrap();
             }
             transaction_asker.await.unwrap();
+            if let Some(v) = start_salt_broadcastor {
+                v.await.unwrap();
+            }
         });
         (handle, tx)
     }
@@ -333,6 +346,7 @@ impl SimulatedNode {
                 );
                 curr_peer
                     .send_message_through_edge(message, self.node_index)
+                    .await
                     .unwrap();
             } else {
                 log::warn!(
@@ -353,7 +367,8 @@ impl SimulatedNode {
         self.emit_time_usage_event(
             1000 * msg.as_slice().len(),
             format!("Decoding RelayMessage at {}", self.get_node_name()),
-        );
+        )
+        .await;
         match msg.as_reader().to_enum() {
             RelayMessageUnionReader::RelayTransactionHashes(reader) => {
                 // Receiving RelayTransactionHashes, record unknown tx hashes
@@ -478,42 +493,57 @@ impl SimulatedNode {
                 let u64_q: u64 = reader.q().unpack();
                 let f64_q: f64 = f64::from_le_bytes(u64_q.to_le_bytes());
                 // |remote_set_size-local_set_size|+q*min(remote_set_size,local_set_size)+1
-                let expected_set_size = ((local_set_size.abs_diff(remote_set_size) as f64)
+                let expected_sketch_size = ((local_set_size.abs_diff(remote_set_size) as f64)
                     + f64_q * (remote_set_size.min(local_set_size) as f64)
                     + 1f64) as usize;
                 log::debug!(
-                    "Node {} expected set size {}",
+                    "Node {} expected set size {} (local_set_size={}, remote_set_size={}, f64_q={}) to node {}",
                     self.get_node_index(),
-                    expected_set_size
+                    expected_sketch_size,
+                    local_set_size,
+                    remote_set_size,
+                    f64_q,
+                    source_node_index
                 );
-                let mut sketch = Minisketch::try_new(32, 0, expected_set_size).unwrap();
-                for key in session.iter_short_ids() {
-                    sketch.add(*key as u64);
-                }
+
                 let sketch_buf = {
+                    let mut sketch = Minisketch::try_new(32, 0, expected_sketch_size).unwrap();
+                    for key in session.iter_short_ids() {
+                        sketch.add(*key as u64);
+                    }
                     let mut buf = vec![0u8; sketch.serialized_size()];
                     sketch.serialize(&mut buf).unwrap();
                     buf
                 };
+                log::debug!(
+                    "Node {} packed all short ids {:?} and sended RelayTransactionSketch to {}",
+                    self.get_node_index(),
+                    session.iter_short_ids().collect::<Vec<_>>(),
+                    source_node_index
+                );
+
                 let message = RelayMessageBuilder::default()
                     .set(
                         RelayTransactionSketchBuilder::default()
                             .short_id_sketch(sketch_buf.pack())
-                            .sketch_size((expected_set_size as u32).pack())
+                            .sketch_size((expected_sketch_size as u32).pack())
+                            .set_size((local_set_size as u32).pack())
                             .build(),
                     )
                     .build();
                 if let Some(remote_node) = self.find_node_edge(source_node_index) {
                     remote_node
                         .send_message_through_edge(message, self.get_node_index())
+                        .await
                         .unwrap();
                     log::debug!(
-                        "Node {} sending RelayTransactionSketch to {}",
+                        "Node {} sending RelayTransactionSketch to {}, self short id pool={:?}",
                         self.get_node_index(),
-                        source_node_index
+                        source_node_index,
+                        session.iter_short_ids().collect::<Vec<_>>()
                     );
                     session
-                        .switch_to_basic_sketch_sended(expected_set_size)
+                        .switch_to_basic_sketch_sended(expected_sketch_size)
                         .unwrap();
                 } else {
                     log::error!("Bad source node: {}", source_node_index);
@@ -544,11 +574,12 @@ impl SimulatedNode {
                     self.get_node_index(),
                     initial_size * 2
                 );
-                let mut sketch = Minisketch::try_new(32, 0, initial_size * 2).unwrap();
-                for key in session.iter_short_ids() {
-                    sketch.add(*key as u64);
-                }
+
                 let sketch_buf = {
+                    let mut sketch = Minisketch::try_new(32, 0, initial_size * 2).unwrap();
+                    for key in session.iter_short_ids() {
+                        sketch.add(*key as u64);
+                    }
                     let mut buf = vec![0u8; sketch.serialized_size()];
                     sketch.serialize(&mut buf).unwrap();
                     buf
@@ -558,6 +589,7 @@ impl SimulatedNode {
                         RelayTransactionSketchBuilder::default()
                             .short_id_sketch(sketch_buf.pack())
                             .sketch_size(((initial_size * 2) as u32).pack())
+                            .set_size((session.snapshot().len() as u32).pack())
                             .build(),
                     )
                     .build();
@@ -568,7 +600,7 @@ impl SimulatedNode {
                     message.as_slice().len()
                 );
                 if let Some(edge) = self.find_node_edge(source_node_index) {
-                    edge.send_message_through_edge(message, self.get_node_index()).with_context(||anyhow!("Node {}: Unable to send RelayTransactionSketch for extended to source node {}",self.get_node_index(),source_node_index))?;
+                    edge.send_message_through_edge(message, self.get_node_index()).await.with_context(||anyhow!("Node {}: Unable to send RelayTransactionSketch for extended to source node {}",self.get_node_index(),source_node_index))?;
                     session.switch_to_extended_sketch_sended().unwrap();
                 } else {
                     bail!("Source edge not found");
@@ -589,10 +621,12 @@ impl SimulatedNode {
                 };
                 if reader.success().unpack() {
                     log::debug!(
-                        "Node {} got an successful set recover from {}, with {} missing txs",
+                        "Node {} got an successful set recover from {}, with {} missing txs: {:?}, holding short_ids: {:?}",
                         self.get_node_index(),
                         source_node_index,
-                        reader.missing_short_ids().len()
+                        reader.missing_short_ids().len(),
+                        reader.missing_short_ids().iter().collect::<Vec<_>>(),
+                        session_entry.get().short_id_mapper().keys().collect::<Vec<_>>()
                     );
 
                     // Requester says it recovered successfully, so we can send missing txs to it
@@ -602,17 +636,27 @@ impl SimulatedNode {
                         .to_entity()
                         .into_iter()
                         .map(|item| session_entry.get().short_id_mapper().get(&item.unpack()))
-                        .map(|x| x.cloned().unwrap())
+                        .map(|x| x.cloned())
                         .collect::<Vec<_>>();
-                    log::debug!(
-                        "Node {} replied to RelayTransactionSketchResult from {}: sended {} txs",
-                        self.get_node_index(),
-                        source_node_index,
-                        to_send_hashes.len()
-                    );
-                    self.send_relay_transaction_to(source_node_index, to_send_hashes)
+                    if to_send_hashes.iter().any(|x| x.is_none()) {
+                        log::warn!("Node {} received at least one false positive decode result from {}, flooding hashes to it",self.get_node_index(),source_node_index);
+                        self.flood_broadcast_hashes(Some(vec![source_node_index]))
+                            .await;
+                    } else {
+                        log::debug!(
+                            "Node {} replied to RelayTransactionSketchResult from {}: sended {} txs",
+                            self.get_node_index(),
+                            source_node_index,
+                            to_send_hashes.len()
+                        );
+                        self.send_relay_transaction_to(
+                            source_node_index,
+                            to_send_hashes.into_iter().map(Option::unwrap).collect(),
+                        )
                         .await
                         .with_context(|| anyhow!("Unable to send relay transaction"))?;
+                    }
+
                     log::debug!(
                         "Node {}: erlay session {} (responder) and {} (requester) ended",
                         self.get_node_index(),
@@ -638,8 +682,9 @@ impl SimulatedNode {
             }
             RelayMessageUnionReader::RelayTransactionSketch(reader) => {
                 log::debug!(
-                    "Node {} handling RelayTransactionSketch",
-                    self.get_node_index()
+                    "Node {} handling RelayTransactionSketch from {}",
+                    self.get_node_index(),
+                    source_node_index
                 );
                 let mut sessions = self.erlay_requester_sessions.write().await;
                 let mut session = match sessions.entry(source_node_index) {
@@ -649,6 +694,13 @@ impl SimulatedNode {
                         bail!("Invalid session");
                     }
                 };
+                log::debug!(
+                    "Node {} received RelayTransactionSketch from {}, self short_id pool={:?}",
+                    self.get_node_index(),
+                    source_node_index,
+                    session.get().short_id_mapper().keys().collect::<Vec<_>>()
+                );
+
                 // Handling of RelayTransactionSketch will always produce a message to be sended
                 let message_to_send = match session.get().current_stage() {
                     ErlayRequesterStage::Initialized => unreachable!(),
@@ -672,6 +724,7 @@ impl SimulatedNode {
                                 .expect("Failed to merge sketch");
                             remote_sketch.decode(&mut decoded_set)
                         };
+                        let short_id_mapper = session.get().short_id_mapper();
                         match decode_result {
                             Ok(diff_size) => {
                                 log::info!(
@@ -680,26 +733,51 @@ impl SimulatedNode {
                                     source_node_index,
                                     diff_size
                                 );
+                                log::debug!(
+                                    "Node {} decode sketch from {} with contents {:?}, self short_id = {:?}",
+                                    self.get_node_index(),
+                                    source_node_index,
+                                    &decoded_set[0..diff_size],
+                                    session.get().short_id_mapper().keys().collect::<Vec<_>>()
+                                );
                                 let local_set_size = session.get().snapshot_set_size() as f64;
                                 let remote_set_size =
                                     Unpack::<u32>::unpack(&reader.set_size()) as f64;
                                 let new_q = (diff_size as f64
                                     - (local_set_size - remote_set_size).abs())
                                     / (local_set_size.min(remote_set_size));
+                                log::debug!(
+                                    "Node {} updating q to {} (local_set_size={},\
+                                 remote_set_size={}, diff_size={}), in the session with {}",
+                                    self.get_node_index(),
+                                    new_q,
+                                    local_set_size,
+                                    remote_set_size,
+                                    diff_size,
+                                    source_node_index
+                                );
                                 *self.erlay_q.lock().await = new_q;
+                                // Only send short ids that we don't have, these are txs held by the opposite side
+                                let to_send_short_ids = decoded_set
+                                    .into_iter()
+                                    .take(diff_size)
+                                    .filter(|x| !short_id_mapper.contains_key(&(*x as u32)))
+                                    .map(|x| x as u32)
+                                    .collect::<Vec<_>>();
 
                                 session.remove();
+                                log::debug!(
+                                    "Node {} sending RelayTransactionSketchResult \
+                                (success) to {}, with missing short ids = {:?}",
+                                    self.get_node_index(),
+                                    source_node_index,
+                                    to_send_short_ids
+                                );
                                 RelayMessageBuilder::default()
                                     .set(
                                         RelayTransactionSketchResultBuilder::default()
                                             .success((true).pack())
-                                            .missing_short_ids(
-                                                decoded_set[0..diff_size]
-                                                    .iter()
-                                                    .map(|x| *x as u32)
-                                                    .collect::<Vec<_>>()
-                                                    .pack(),
-                                            )
+                                            .missing_short_ids(to_send_short_ids.pack())
                                             .build(),
                                     )
                                     .build()
@@ -745,6 +823,7 @@ impl SimulatedNode {
                 };
                 if let Some(edge) = self.find_node_edge(source_node_index) {
                     edge.send_message_through_edge(message_to_send, self.get_node_index())
+                        .await
                         .unwrap();
                 } else {
                     log::warn!(
@@ -814,6 +893,7 @@ impl SimulatedNode {
         if let Some(to_edge) = self.find_node_edge(to_node) {
             to_edge
                 .send_message_through_edge(message, self.get_node_index())
+                .await
                 .unwrap();
             log::info!(
                 "Node {} sended GetRelayTransactionSketch to {}, q = {}, set_size = {}",
@@ -822,6 +902,13 @@ impl SimulatedNode {
                 q,
                 session.snapshot_set_size()
             );
+            log::debug!(
+                "Node {} sended GetRelayTransactionSketch to {}, self short_id pool = {:?}",
+                self.get_node_index(),
+                to_node,
+                session.short_id_mapper().keys().collect::<Vec<_>>()
+            );
+
             session.switch_to_waiting_for_sketch().unwrap();
             entry.insert(session);
         } else {
@@ -877,6 +964,7 @@ impl SimulatedNode {
             );
             to_edge
                 .send_message_through_edge(message, self.node_index)
+                .await
                 .unwrap();
         } else {
             log::warn!(
@@ -946,6 +1034,7 @@ impl SimulatedNode {
                 .build();
             let message = RelayMessage::new_builder().set(content).build();
             peer.send_message_through_edge(message, self.node_index)
+                .await
                 .unwrap();
             log::debug!(
                 "Node {} flooded {} hashes to {}",

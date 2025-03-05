@@ -1,9 +1,9 @@
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
 use ckb_gen_types::packed::RelayMessage;
 
 use crate::{
-    node::SimulatedNode,
+    node::{NodeConfig, SimulatedNode},
     util::{Event, MessagePack},
 };
 use ckb_gen_types::prelude::Entity;
@@ -13,16 +13,20 @@ pub struct NodeEdge {
     pub to_node: Weak<SimulatedNode>,
     pub sender: tokio::sync::mpsc::UnboundedSender<MessagePack>,
     pub event_sender: tokio::sync::mpsc::UnboundedSender<Event>,
+    pub config: Arc<NodeConfig>,
 }
 
 impl NodeEdge {
-    fn emit_time_usage_event(&self, time_usage: usize, description: String) {
+    async fn emit_time_usage_event(&self, time_usage: usize, description: String) {
         self.event_sender
             .send(Event::TimeUsage {
                 time_usage,
                 description,
             })
             .unwrap();
+        if self.config.enable_real_time_simulation {
+
+        }
     }
     pub fn emit_data_usage_event(&self, data_usage: usize, description: String) {
         self.event_sender
@@ -33,7 +37,7 @@ impl NodeEdge {
             .unwrap();
     }
 
-    pub fn send_message_through_edge(
+    pub async fn send_message_through_edge(
         &self,
         msg: RelayMessage,
         source_index: usize,
@@ -45,7 +49,7 @@ impl NodeEdge {
                 "Encoding message overhead from {:03} to {:03}",
                 source_index, to_node_idx
             ),
-        );
+        ).await;
         let message_length = msg.as_slice().len();
 
         let time_usage = self.distance * 1000_000 / 10 + message_length * 1000;
@@ -59,7 +63,7 @@ impl NodeEdge {
                     "Message transport overhead from {} to {}",
                     source_index, to_node_idx
                 ),
-            );
+            ).await;
             self.emit_data_usage_event(
                 message_length,
                 format!(
