@@ -112,7 +112,7 @@ impl UnknownTxHashPriority {
 
     pub fn next_request_at(&self) -> Instant {
         if self.requested {
-            self.request_time + Duration::from_millis(100)
+            self.request_time + Duration::from_secs(30)
         } else {
             self.request_time
         }

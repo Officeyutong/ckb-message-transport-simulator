@@ -18,7 +18,7 @@ mod node;
 mod util;
 
 const NODE_COUNT: usize = 10;
-const TX_COUNT: usize = 100;
+const TX_COUNT: usize = 1000;
 const EDGE_COUNT: usize = 30;
 
 const GRAPH_SEED: u64 = 0xDEADBEEF;
@@ -147,11 +147,15 @@ fn main() -> anyhow::Result<()> {
             std::thread::spawn(move || {
                 let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(TX_SEED);
                 for _ in 0..TX_COUNT {
-                    let selected_node = nodes.choose(&mut rng).unwrap();
-                    selected_node.add_transaction(create_random_transaction(&mut rng));
+                    let tx = create_random_transaction(&mut rng);
+                    for selected_node in nodes.choose_multiple(&mut rng, 3) {
+                        selected_node.add_transaction(tx.clone());
+                    }
+
                     if SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
                         return;
                     }
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 log::info!("Transaction generating done");
             })
@@ -207,9 +211,9 @@ fn main() -> anyhow::Result<()> {
     let (total_time, total_data, total_real_time) = result
         .iter()
         .fold((0, 0, 0), |x, y| (x.0 + y.0, x.1 + y.1, x.2 + y.2));
-    log::info!("Average time usage: {}", total_time / result.len());
-    log::info!("Average data usage: {}", total_data / result.len());
-    log::info!(
+    println!("Average time usage: {}", total_time / result.len());
+    println!("Average data usage: {}", total_data / result.len());
+    println!(
         "Average real time usage: {}",
         total_real_time / result.len() as u128
     );

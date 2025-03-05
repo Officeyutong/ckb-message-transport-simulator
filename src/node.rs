@@ -162,7 +162,7 @@ impl SimulatedNode {
                             log::info!("Node {}-transaction asker exiting..",new_self.get_node_name());
                             break;
                         }
-                        _ = tokio::time::sleep(Duration::from_millis(300)) => {
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
                             log::info!("Node {} asking for missing txs..",new_self.get_node_name());
                             new_self.ask_for_missing_txs().await;
                         }
@@ -180,7 +180,7 @@ impl SimulatedNode {
                             log::info!("Node {}-flood worker exiting..",new_self.get_node_name());
                             break;
                         }
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        _ = tokio::time::sleep(Duration::from_millis(300)) => {
                             log::info!("Node {} flooding..",new_self.get_node_name());
                             new_self.flood_broadcast_hashes(None).await;
                         }
